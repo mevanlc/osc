@@ -26,6 +26,19 @@ asdf
 # Clipboard cleared
 ```
 
+#### Setting the terminal title
+
+```bash
+❯ osc title my terminal title
+# Terminal title set to 'my terminal title' (defaults to OSC 2)
+
+❯ osc title-0 my terminal title
+# Terminal title and icon name set using OSC 0
+
+❯ osc title-1 my icon name
+# Terminal icon name set using OSC 1
+```
+
 ## Usage
 
 ```
@@ -39,6 +52,9 @@ Available Commands:
   copy        Copies input to the system clipboard
   help        Help about any command
   paste       Outputs system clipboard contents to stdout
+  title       Sets the terminal title using OSC 2
+  title-0     Sets the terminal title using OSC 0
+  title-1     Sets the terminal title using OSC 1
   version     Outputs version information
 
 Flags:

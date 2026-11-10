@@ -43,8 +43,8 @@ var (
 	deviceFlag    string
 	clipboardFlag string
 	timeoutFlag   float64
-	debugLog      *log.Logger
-	errorLog      *log.Logger
+	debugLog      *log.Logger = log.New(io.Discard, "", 0)
+	errorLog      *log.Logger = log.New(os.Stderr, "ERROR ", log.LstdFlags|log.Lmsgprefix)
 )
 
 type debugWriter struct {
@@ -133,19 +133,40 @@ func identifyTerm() error {
 		}
 	}
 
-	oscOpen = OSC + clipboardFlag + ";"
-	oscClose = string(ESC) + string(BS)
+	oscOpen, oscClose = oscSequence("52;" + clipboardFlag)
+
+	return nil
+}
+
+func oscSequence(cmd string) (string, string) {
+	open := string(ESC) + "]" + cmd + ";"
+	close := string(ESC) + string(BS)
 
 	if isScreen {
 		debugLog.Println("Setting screen dcs passthrough")
-		oscOpen = DCS_OPEN + oscOpen
-		oscClose = oscClose + DCS_CLOSE
+		open = DCS_OPEN + open
+		close = close + DCS_CLOSE
 	} else if isTmux {
 		debugLog.Println("Setting tmux dcs passthrough")
-		oscOpen = DCS_OPEN + "tmux;" + string(ESC) + oscOpen
-		oscClose = oscClose + DCS_CLOSE
+		open = DCS_OPEN + "tmux;" + string(ESC) + open
+		close = close + DCS_CLOSE
 	}
 
+	return open, close
+}
+
+func checkTmuxPassthrough() error {
+	if isTmux {
+		if out, err := exec.Command("tmux", "show", "-gwsv", "allow-passthrough").Output(); err != nil {
+			return fmt.Errorf("Error running 'tmux show -gwsv allow-passthrough': %w", err)
+		} else {
+			outStr := strings.TrimSpace(string(out))
+			debugLog.Println("'tmux show -gwsv allow-passthrough':", outStr)
+			if outStr != "on" && outStr != "all" {
+				return fmt.Errorf("tmux allow-passthrough must be set to 'on' or 'all'")
+			}
+		}
+	}
 	return nil
 }
 
@@ -184,16 +205,8 @@ func (w *chunkingWriter) Write(p []byte) (n int, err error) {
 
 func copy(fnames []string) error {
 	// copy
-	if isTmux {
-		if out, err := exec.Command("tmux", "show", "-gwsv", "allow-passthrough").Output(); err != nil {
-			return fmt.Errorf("Error running 'tmux show -gwsv allow-passthrough': %w", err)
-		} else {
-			outStr := strings.TrimSpace(string(out))
-			debugLog.Println("'tmux show -gwsv allow-passthrough':", outStr)
-			if outStr != "on" && outStr != "all" {
-				return fmt.Errorf("tmux allow-passthrough must be set to 'on' or 'all'")
-			}
-		}
+	if err := checkTmuxPassthrough(); err != nil {
+		return err
 	}
 
 	var data []byte
@@ -418,6 +431,69 @@ func paste() error {
 	return nil
 }
 
+func writeTitle(w io.Writer, oscCode, titleStr string) error {
+	titleOpen, titleClose := oscSequence(oscCode)
+
+	if _, err := fmt.Fprint(w, titleOpen); err != nil {
+		return fmt.Errorf("Error writing osc open: %w", err)
+	}
+
+	dataWriter := w
+	if isScreen {
+		dataWriter = &chunkingWriter{writer: w}
+	}
+
+	data := []byte(titleStr)
+	if isTmux {
+		data = bytes.ReplaceAll(data, []byte{ESC}, []byte{ESC, ESC})
+	}
+
+	if _, err := dataWriter.Write(data); err != nil {
+		return fmt.Errorf("Error writing title: %w", err)
+	}
+
+	if _, err := fmt.Fprint(w, titleClose); err != nil {
+		return fmt.Errorf("Error writing osc close: %w", err)
+	}
+
+	return nil
+}
+
+func setTitle(oscCode, titleStr string) error {
+	if err := checkTmuxPassthrough(); err != nil {
+		return err
+	}
+
+	debugLog.Printf("Beginning osc%s title operation\n", oscCode)
+
+	tty, err := opentty()
+	if err != nil {
+		return fmt.Errorf("Error opening tty: %w", err)
+	}
+	defer closetty(tty)
+
+	// Open buffered output
+	var ttyWriter *bufio.Writer
+	if verboseFlag {
+		ttyWriter = bufio.NewWriter(&debugWriter{
+			prefix: "tty write",
+			w:      tty,
+		})
+	} else {
+		ttyWriter = bufio.NewWriter(tty)
+	}
+
+	if err := writeTitle(ttyWriter, oscCode, titleStr); err != nil {
+		return err
+	}
+
+	if err := ttyWriter.Flush(); err != nil {
+		return fmt.Errorf("Error flushing bufio: %w", err)
+	}
+
+	return nil
+}
+
 func closeSilently(f *os.File) {
 	if f != nil {
 		_ = f.Close()
@@ -501,6 +577,47 @@ osc paste`,
 	},
 }
 
+func newTitleCmd(name, oscCode string) *cobra.Command {
+	return &cobra.Command{
+		Use:   name + " <str> [str...]",
+		Short: fmt.Sprintf("Sets the terminal title using OSC %s", oscCode),
+		Long: fmt.Sprintf(`Sets the terminal title using OSC %s. Usage:
+
+osc %s <str> [str...]`, oscCode, name),
+		Args: cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			rc := func() int {
+				if logfile, err := initLogging(); err != nil {
+					if errorLog != nil {
+						errorLog.Println(err)
+					}
+					fmt.Println(err)
+					return 1
+				} else {
+					defer closeSilently(logfile)
+				}
+				if err := identifyTerm(); err != nil {
+					errorLog.Println(err)
+					fmt.Println(err)
+					return 1
+				}
+				if err := setTitle(oscCode, strings.Join(args, " ")); err != nil {
+					errorLog.Println(err)
+					fmt.Println(err)
+					return 1
+				}
+				return 0
+			}()
+			os.Exit(rc)
+			return nil
+		},
+	}
+}
+
+var title0Cmd = newTitleCmd("title-0", "0")
+var title1Cmd = newTitleCmd("title-1", "1")
+var title2Cmd = newTitleCmd("title-2", "2")
+
 var versionCmd = &cobra.Command{
 	Use:   "version",
 	Short: "Outputs version information",
@@ -542,6 +659,9 @@ func init() {
 
 	rootCmd.AddCommand(copyCmd)
 	rootCmd.AddCommand(pasteCmd)
+	rootCmd.AddCommand(title0Cmd)
+	rootCmd.AddCommand(title1Cmd)
+	rootCmd.AddCommand(title2Cmd)
 	rootCmd.AddCommand(versionCmd)
 }
 
